@@ -1,0 +1,51 @@
+version: '3'
+
+tasks:
+  fetch:
+    desc: Fetch pinned pgrust and wasm2go sources
+    cmds:
+      - ./scripts/fetch-upstream.sh
+
+  build:wasm:
+    desc: Build pgrust as LP64 wasm64, then lower its memory/table instructions to wasm32
+    deps: [fetch]
+    cmds:
+      - ./scripts/build-wasm.sh
+
+  feasibility:
+    desc: Verify that wasm2go can parse the pinned pgrust module
+    deps: [build:wasm]
+    cmds:
+      - ./scripts/check-feasibility.sh
+
+  generate:go:
+    desc: Translate the lowered pgrust module into portable pure Go
+    deps: [build:wasm]
+    cmds:
+      - ./scripts/generate-go.sh
+
+  generate:fixture:
+    desc: Build native pgrust initdb and pack the immutable in-memory template
+    deps: [fetch]
+    cmds:
+      - ./scripts/build-fixture.sh
+
+  test:
+    desc: Run Go unit tests
+    cmds:
+      - go test -race ./...
+
+  check:cgo:
+    desc: Reject cgo dependencies
+    cmds:
+      - |
+        packages="$(CGO_ENABLED=0 go list -deps -f '{{`{{if .CgoFiles}}{{.ImportPath}}{{end}}`}}' ./... | sed '/^$/d')"
+        test -z "$packages" || { printf '%s\n' "$packages"; exit 1; }
+
+  check:cross:
+    desc: Compile the public package for the supported platform matrix
+    cmds:
+      - |
+        for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64; do
+          GOOS=${target%/*} GOARCH=${target#*/} CGO_ENABLED=0 go build ./...
+        done

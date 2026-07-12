@@ -1,0 +1,106 @@
+diff --git a/internal/wasm/parser.go b/internal/wasm/parser.go
+index a66097a..ef52c35 100644
+--- a/internal/wasm/parser.go
++++ b/internal/wasm/parser.go
+@@ -217,6 +217,30 @@ func readLimits(r byteReader) (Limits, error) {
+ 	return lim, nil
+ }
+ 
++func readMemoryType(r byteReader) (MemoryType, error) {
++	flags, err := r.ReadByte()
++	if err != nil {
++		return MemoryType{}, err
++	}
++	if flags&^byte(0x07) != 0 {
++		return MemoryType{}, fmt.Errorf("memory limits: unsupported flags %#x", flags)
++	}
++	min, err := readU64(r)
++	if err != nil {
++		return MemoryType{}, err
++	}
++	memory := MemoryType{Limits: Limits{Min: min}, Is64: flags&0x04 != 0}
++	if flags&0x01 != 0 {
++		max, err := readU64(r)
++		if err != nil {
++			return MemoryType{}, err
++		}
++		memory.Limits.Max = max
++		memory.Limits.HasMax = true
++	}
++	return memory, nil
++}
++
+ func parseImportSection(m *Module, r byteReader) error {
+ 	n, err := readU32(r)
+ 	if err != nil {
+@@ -257,11 +281,11 @@ func parseImportSection(m *Module, r byteReader) error {
+ 			}
+ 			imp.Table = TableType{ElemType: ValType(et), Limits: lim}
+ 		case ImportMemory:
+-			lim, err := readLimits(r)
++			memory, err := readMemoryType(r)
+ 			if err != nil {
+ 				return err
+ 			}
+-			imp.Memory = MemoryType{Limits: lim}
++			imp.Memory = memory
+ 		case ImportGlobal:
+ 			vt, err := r.ReadByte()
+ 			if err != nil {
+@@ -368,11 +392,11 @@ func parseMemorySection(m *Module, r byteReader) error {
+ 	}
+ 	m.Memories = make([]MemoryType, n)
+ 	for i := uint32(0); i < n; i++ {
+-		lim, err := readLimits(r)
++		memory, err := readMemoryType(r)
+ 		if err != nil {
+ 			return err
+ 		}
+-		m.Memories[i] = MemoryType{Limits: lim}
++		m.Memories[i] = memory
+ 	}
+ 	return nil
+ }
+diff --git a/internal/wasm/wasm_test.go b/internal/wasm/wasm_test.go
+index 35b01c7..2f44777 100644
+--- a/internal/wasm/wasm_test.go
++++ b/internal/wasm/wasm_test.go
+@@ -195,6 +195,23 @@ func TestParseMemory(t *testing.T) {
+ 	}
+ }
+ 
++func TestParseMemory64(t *testing.T) {
++	// (module (memory i64 1 4)) encoded with the Memory64 limits flag.
++	payload := []byte{0x01, 0x05, 0x01, 0x04}
++	b := append(append([]byte{}, wasmHeader...), 0x05, byte(len(payload)))
++	b = append(b, payload...)
++	m, err := wasm.Parse(bytes.NewReader(b))
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(m.Memories) != 1 || !m.Memories[0].Is64 {
++		t.Fatalf("memory = %#v, want one memory64", m.Memories)
++	}
++	if m.Memories[0].Limits.Min != 1 || !m.Memories[0].Limits.HasMax || m.Memories[0].Limits.Max != 4 {
++		t.Fatalf("limits = %#v", m.Memories[0].Limits)
++	}
++}
++
+ // TestParseHello tests hello.wasm: 1 import (fd_write), 1 memory, 3 data segments, 1 func export.
+ func TestParseHello(t *testing.T) {
+ 	m := mustParseFile(t, "hello.wasm")
+diff --git a/cmd/wasm2go/main.go b/cmd/wasm2go/main.go
+index 390f31e..c283710 100644
+--- a/cmd/wasm2go/main.go
++++ b/cmd/wasm2go/main.go
+@@ -239,8 +239,8 @@ func printSummary(w io.Writer, m *wasm.Module) error {
+ 	ew.Fprintf("tables:   %d (defined)\n", len(m.Tables))
+ 	ew.Fprintf("memories: %d (defined)\n", len(m.Memories))
+ 	for i, mem := range m.Memories {
+-		ew.Fprintf("  mem[%d]: min=%d pages (=%d MiB) max=%d hasMax=%v\n",
+-			i, mem.Limits.Min, mem.Limits.Min*64/1024, mem.Limits.Max, mem.Limits.HasMax)
++		ew.Fprintf("  mem[%d]: min=%d pages (=%d MiB) max=%d hasMax=%v memory64=%v\n",
++			i, mem.Limits.Min, mem.Limits.Min*64/1024, mem.Limits.Max, mem.Limits.HasMax, mem.Is64)
+ 	}
+ 	ew.Fprintf("globals:  %d (defined)\n", len(m.Globals))
+ 	ew.Fprintf("exports:  %d\n", len(m.Exports))

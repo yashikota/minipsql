@@ -1,0 +1,156 @@
+diff --git a/internal/gcasm/capture.go b/internal/gcasm/capture.go
+index 91f0292..1ab1808 100644
+--- a/internal/gcasm/capture.go
++++ b/internal/gcasm/capture.go
+@@ -1,7 +1,9 @@
+ package gcasm
+ 
+ import (
++	"bufio"
+ 	"fmt"
++	"io"
+ 	"os"
+ 	"os/exec"
+ 	"regexp"
+@@ -61,14 +63,36 @@ func Capture(pkgDir, pkgPath string) ([]*Fn, []*DataSym, error) {
+ // arch is pinned explicitly rather than inherited from the environment
+ // (the primary dev machine is darwin/arm64 under Rosetta).
+ func captureArch(pkgDir, pkgPath, arch string) ([]*Fn, []*DataSym, error) {
++	listing, err := os.CreateTemp(pkgDir, "gcasm-listing-*.txt")
++	if err != nil {
++		return nil, nil, fmt.Errorf("gcasm capture: create listing: %w", err)
++	}
++	listingName := listing.Name()
++	defer func() {
++		_ = listing.Close()
++		_ = os.Remove(listingName)
++	}()
++
+ 	cmd := exec.Command("go", "build", "-gcflags", pkgPath+"=-S", "./...")
+ 	cmd.Dir = pkgDir
+ 	cmd.Env = append(os.Environ(), "GOARCH="+arch)
+-	out, err := cmd.CombinedOutput()
+-	if err != nil {
+-		return nil, nil, fmt.Errorf("gcasm capture: go build: %w\n%s", err, clip(out))
++	// Compiler -S output can be several gigabytes for a large translated
++	// module. CombinedOutput keeps that entire listing live next to the
++	// generated source tree and exhausts memory before parsing starts. Spool
++	// it to disk and parse incrementally instead.
++	cmd.Stdout = listing
++	cmd.Stderr = listing
++	if err := cmd.Run(); err != nil {
++		tail, tailErr := readTail(listing, 2000)
++		if tailErr != nil {
++			return nil, nil, fmt.Errorf("gcasm capture: go build: %w (read diagnostic: %v)", err, tailErr)
++		}
++		return nil, nil, fmt.Errorf("gcasm capture: go build: %w\n%s", err, tail)
+ 	}
+-	return ParseListing(string(out))
++	if _, err := listing.Seek(0, io.SeekStart); err != nil {
++		return nil, nil, fmt.Errorf("gcasm capture: rewind listing: %w", err)
++	}
++	return ParseListingReader(listing)
+ }
+ 
+ var (
+@@ -85,11 +109,24 @@ var (
+ // interleaved at FUNCTION granularity — gc prints each function
+ // block atomically under its output lock).
+ func ParseListing(listing string) ([]*Fn, []*DataSym, error) {
++	return ParseListingReader(strings.NewReader(listing))
++}
++
++// ParseListingReader parses a compiler listing without materialising the
++// complete output or a strings.Split copy. This is the production path for
++// multi-gigabyte generated modules; ParseListing remains the convenient test
++// API for small fixtures.
++func ParseListingReader(listing io.Reader) ([]*Fn, []*DataSym, error) {
+ 	var fns []*Fn
+ 	var datas []*DataSym
+ 	var cur *Fn
+ 	var curData *DataSym
+-	for _, line := range strings.Split(listing, "\n") {
++	scanner := bufio.NewScanner(listing)
++	// Assembly lines are normally small, but generated symbol/type rows can be
++	// much larger than Scanner's 64 KiB default.
++	scanner.Buffer(make([]byte, 64*1024), 16*1024*1024)
++	for scanner.Scan() {
++		line := scanner.Text()
+ 		if m := stextRe.FindStringSubmatch(line); m != nil {
+ 			cur = &Fn{Name: m[1]}
+ 			curData = nil
+@@ -178,11 +215,36 @@ func ParseListing(listing string) ([]*Fn, []*DataSym, error) {
+ 			}
+ 		}
+ 	}
++	if err := scanner.Err(); err != nil {
++		return nil, nil, fmt.Errorf("gcasm: read compiler listing: %w", err)
++	}
+ 	sort.Slice(fns, func(i, j int) bool { return fns[i].Name < fns[j].Name })
+ 	sort.Slice(datas, func(i, j int) bool { return datas[i].Name < datas[j].Name })
+ 	return fns, datas, nil
+ }
+ 
++func readTail(f *os.File, limit int64) (string, error) {
++	end, err := f.Seek(0, io.SeekEnd)
++	if err != nil {
++		return "", err
++	}
++	start := end - limit
++	if start < 0 {
++		start = 0
++	}
++	if _, err := f.Seek(start, io.SeekStart); err != nil {
++		return "", err
++	}
++	b, err := io.ReadAll(f)
++	if err != nil {
++		return "", err
++	}
++	if start > 0 {
++		return "[clipped]..." + string(b), nil
++	}
++	return string(b), nil
++}
++
+ func clip(b []byte) string {
+ 	if len(b) > 2000 {
+ 		return "[clipped]..." + string(b[len(b)-2000:])
+diff --git a/transpile/transpile.go b/transpile/transpile.go
+index 8a5f555..35ee4a7 100644
+--- a/transpile/transpile.go
++++ b/transpile/transpile.go
+@@ -24,6 +24,7 @@ import (
+ 	"bytes"
+ 	"fmt"
+ 	"io"
++	"os"
+ 	"strings"
+ 
+ 	"github.com/goccy/wasm2go/internal/codegen"
+@@ -78,6 +79,24 @@ func Translate(w io.Writer, m *Module, opts Options) (Result, error) {
+ 		return res, err
+ 	}
+ 
++	// The gcasm capture path compiles every generated function with -S for two
++	// architectures. Very large modules may deliberately choose the existing
++	// pure-Go fallback instead: it is portable to every GOARCH and avoids a
++	// generation-time assembly listing several times larger than the source.
++	// This changes performance only, not Wasm semantics or the public API.
++	if os.Getenv("WASM2GO_PURE_GO") == "1" {
++		if len(mainBuf.Bytes()) > 0 {
++			filtered := gcasm.PureFilter(map[string][]byte{"gen.go": mainBuf.Bytes()})
++			mainBuf.Reset()
++			mainBuf.Write(filtered["gen.go"])
++		}
++		res.Files = gcasm.PureFilter(res.Files)
++		if _, err := w.Write(mainBuf.Bytes()); err != nil {
++			return res, err
++		}
++		return res, nil
++	}
++
+ 	// gcasm backend: replace the own-emitter asm bundle.
+ 	treeIn := map[string][]byte{}
+ 	for name, data := range res.Sidecars {
+

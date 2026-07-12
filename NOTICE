@@ -1,0 +1,13 @@
+minipsql is based on pgrust:
+
+    https://github.com/malisper/pgrust
+    Copyright its contributors, licensed under AGPL-3.0
+
+The generated Go engine will be produced with wasm2go:
+
+    https://github.com/goccy/wasm2go
+    Copyright its contributors, licensed under the MIT License
+
+Exact source revisions are recorded in tools/versions.env. Generated releases
+must retain this notice and their machine-readable provenance manifest.
+
